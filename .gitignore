@@ -1,0 +1,37 @@
+# ── Python-generated files ────────────────────────────────────────────────────
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv
+
+# ── Secrets / environment ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example          # keep the example template (no real keys)
+src/.env
+
+# ── Markdown / documentation files ───────────────────────────────────────────
+*.md
+
+# ── Lock files (optional – commit if you want reproducible installs) ──────────
+uv.lock
+
+# ── IDE & editor files ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── macOS noise ───────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Python version pin (local dev only) ──────────────────────────────────────
+.python-version
