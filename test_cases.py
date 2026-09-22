@@ -33,6 +33,9 @@ def _make_state() -> RestaurantState:
         "dish_name":      "",
         "required_qty":   0,
         "available_qty":  0,
+        "order_items":    [],
+        "item_queue":     [],
+        "served_items":   [],
         "order_id":       "",
         "status":         "pending",
         "order_retries":  3,
@@ -260,8 +263,48 @@ def test_tc3() -> bool:
     return passed
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  Main
+#  TEST CASE 4
+#  Multi-item order: 2 burgers + 1 soda, both succeed on first cook+serve.
+#  Expected: overall SUCCESS, served_items has both items.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_tc4() -> bool:
+    print("\n" + "═"*62)
+    print("  TEST CASE 4  — Multi-item order")
+    print("  User: 'I want 2 burgers and a soda'")
+    print("  LLM extracts: [{burger,2}, {soda,1}]")
+    print("  Cook burger: success; Serve burger: success → pop soda")
+    print("  Cook soda:   success; Serve soda:   success → complete")
+    print("  Expected: final_result='success', 2 items in served_items")
+    print("═"*62)
+
+    user_inputs   = ["I want 2 burgers and a soda"]
+    llm_responses = ['[{"dish": "burger", "qty": 2}, {"dish": "soda", "qty": 1}]']
+
+    # All random calls succeed (0.9 > 0.4 threshold)
+    # cook burger (1 call) + serve burger (1 call) + cook soda (1 call) + serve soda (1 call)
+    random_values = [0.9, 0.9, 0.9, 0.9]
+
+    state = _run_session(user_inputs, llm_responses, random_values, "TC4")
+
+    served   = state.get("served_items", [])
+    passed   = (
+        state.get("final_result") == "success"
+        and len(served) == 2
+        and any(it["dish"] == "burger" for it in served)
+        and any(it["dish"] == "soda"   for it in served)
+    )
+    print(f"  served_items: {served}")
+    print(f"  Result: {'✅ PASS' if passed else '❌ FAIL'}  "
+          f"(expected final_result='success' + 2 served items, "
+          f"got '{state.get('final_result')}' + {len(served)} items)")
+    return passed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main  (re-registered to include TC4)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -269,6 +312,7 @@ if __name__ == "__main__":
         test_tc1(),
         test_tc2(),
         test_tc3(),
+        test_tc4(),
     ]
 
     total  = len(results)

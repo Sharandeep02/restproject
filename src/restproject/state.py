@@ -14,9 +14,14 @@ class RestaurantState(TypedDict):
     messages: Annotated[list, add_messages]
 
     # ── Extracted order details ───────────────────────────────────────────────
-    dish_name: str          # Extracted dish name (normalized to menu key)
-    required_qty: int       # Quantity the user asked for
-    available_qty: int      # Quantity available in the menu (0 = not in menu)
+    dish_name: str          # Extracted dish name (normalized to menu key) — current item
+    required_qty: int       # Quantity the user asked for — current item
+    available_qty: int      # Quantity available in the menu — current item
+
+    # ── Multi-item order lists ────────────────────────────────────────────────
+    order_items: list       # Raw items from LLM: [{"dish": str, "qty": int}]
+    item_queue: list        # Validated items waiting for the kitchen: [{"dish": str, "qty": int}]
+    served_items: list      # Successfully served items (for final summary): [{"dish": str, "qty": int}]
 
     # ── Order tracking ────────────────────────────────────────────────────────
     order_id: str           # e.g. "ORD-4821"; set by create_order_node

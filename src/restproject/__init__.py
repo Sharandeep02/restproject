@@ -50,12 +50,16 @@ def _step_label(i: int, total: int, content: str) -> str:
         return "📋 Menu ✓"
     if "only have" in c or "please tell me" in c or "would you like" in c:
         return "⚠️  Partial Stock"
-    if "inventory confirmed" in c or "is available" in c:
+    if "all items served" in c or "🎉" in c:
+        return "🎉 All Served"
+    if "inventory check" in c or "📦" in c:
         return "📦 Inventory ✓"
     if "order" in c and "created" in c:
         return "🧾 Order Created"
-    if "hiccup" in c or "trying again" in c or "prepared successfully" in c:
-        return "🍳 Kitchen"
+    if "has been served" in c or "enjoy your meal" in c:
+        return "🛎️  Served"
+    if "order complete" in c:
+        return "🎉 Complete"
     if "served" in c or "enjoy your meal" in c:
         return "🛎️  Served"
     if "order complete" in c:
@@ -101,6 +105,9 @@ def main() -> None:
         "dish_name": "",
         "required_qty": 0,
         "available_qty": 0,
+        "order_items": [],
+        "item_queue": [],
+        "served_items": [],
         "order_id": "",
         "status": "pending",
         "order_retries": 3,

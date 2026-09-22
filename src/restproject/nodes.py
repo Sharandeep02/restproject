@@ -47,11 +47,19 @@ Rules:
    "OFFTOPIC"
    (nothing else)
 
-2. If the message IS about placing an order, extract the dish name and quantity.
-   Reply EXACTLY in this JSON format (no markdown, no extra text):
-   {"dish": "<dish_name_lowercase>", "qty": <integer>}
+2. If the message IS about placing an order, extract ALL dish names and
+   quantities (there may be more than one item).
+   Reply EXACTLY as a JSON array — even for a single item:
+   [{"dish": "<dish_name_lowercase>", "qty": <integer>}, ...]
 
-3. Do NOT handle greetings, general chat, weather, recipes, or anything else.
+   Examples:
+     "I want 2 burgers and a soda"
+       → [{"dish": "burger", "qty": 2}, {"dish": "soda", "qty": 1}]
+     "3 pizzas please"
+       → [{"dish": "pizza", "qty": 3}]
+
+3. Always use singular lowercase dish names (burger not burgers).
+4. Do NOT handle greetings, general chat, weather, recipes, or anything else.
 """
 
 
@@ -60,26 +68,18 @@ Rules:
 # ──────────────────────────────────────────────────────────────────────────────
 def llm_node(state: RestaurantState) -> dict[str, Any]:
     """
-    Calls the LLM to either:
-      • Extract dish + qty from the latest user message, OR
-      • Inform the user it cannot help with off-topic queries.
-
-    Also handles the retry-prompt: if order_retries > 0 and status is
-    'partial' or 'unavailable', it presents options to the user and waits
-    for the next human input.
+    Calls the LLM to extract a list of {dish, qty} items from the user message,
+    or flags OFFTOPIC.  Stores the full list in order_items; sets dish_name /
+    required_qty to the first item so the subsequent nodes can process them
+    one-at-a-time through the pipeline.
     """
-    # ── Build message list for the LLM ───────────────────────────────────────
-    system = SystemMessage(content=_SYSTEM_PROMPT)
+    import json
 
-    # The last message in state.messages is the most recent user turn
-    last_msg = state["messages"][-1]
-
-    # If we're in a re-prompt cycle, the last message is already the user's
-    # decision; pass the whole history for context
+    system  = SystemMessage(content=_SYSTEM_PROMPT)
     response = _get_llm().invoke([system] + state["messages"])
     raw = response.content.strip()
 
-    # ── Parse LLM response ────────────────────────────────────────────────────
+    # ── Off-topic ─────────────────────────────────────────────────────────────
     if raw == "OFFTOPIC":
         ai_msg = AIMessage(
             content=(
@@ -88,39 +88,52 @@ def llm_node(state: RestaurantState) -> dict[str, Any]:
                 "Please tell me what you'd like to order!"
             )
         )
+        return {"messages": [ai_msg], "status": "off_topic"}
+
+    # ── Parse JSON array ──────────────────────────────────────────────────────
+    try:
+        parsed = json.loads(raw)
+
+        # Accept both array and legacy single-object from older model outputs
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+
+        items = [
+            {"dish": str(it["dish"]).strip().lower(), "qty": int(it["qty"])}
+            for it in parsed
+            if it.get("dish") and int(it.get("qty", 0)) > 0
+        ]
+        if not items:
+            raise ValueError("empty item list")
+
+        # ── Confirmation message listing all requested items ──────────────────
+        item_lines = ", ".join(f"{it['qty']}x {it['dish'].title()}" for it in items)
+        ai_msg = AIMessage(
+            content=(
+                f"Got it! I've noted your order: {item_lines}. "
+                "Let me check availability…"
+            )
+        )
+        # Use the first item as the "current" item for the pipeline
+        first = items[0]
         return {
-            "messages": [ai_msg],
-            "status": "off_topic",
+            "messages":    [ai_msg],
+            "order_items": items,
+            "dish_name":   first["dish"],
+            "required_qty": first["qty"],
+            "status":      "pending",
         }
 
-    # Try to parse as JSON order
-    try:
-        import json
-        order = json.loads(raw)
-        dish = order["dish"].strip().lower()
-        qty = int(order["qty"])
-        ai_msg = AIMessage(
-            content=f"Got it! I've noted your order: {qty}x {dish.title()}. Let me check availability…"
-        )
-        return {
-            "messages": [ai_msg],
-            "dish_name": dish,
-            "required_qty": qty,
-            "status": "pending",
-        }
     except Exception:
-        # Fallback – treat as off-topic / unclear
         ai_msg = AIMessage(
             content=(
                 "I couldn't understand your order. "
-                "Please specify the dish name and quantity. "
-                "Example: 'I want 2 burgers'"
+                "Please specify dish name(s) and quantity. "
+                "Example: 'I want 2 burgers and a soda'"
             )
         )
-        return {
-            "messages": [ai_msg],
-            "status": "off_topic",
-        }
+        return {"messages": [ai_msg], "status": "off_topic"}
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -152,98 +165,164 @@ def _normalize_dish(raw: str) -> str:
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  NODE 2 – menu_validator_node
-#  Checks whether the requested dish exists on the menu.
-#  • Found     → status='menu_valid'    → inventory_check_node
-#  • Not found → status='menu_invalid'  → END (main loop re-prompts for free)
+#  Validates ALL items in order_items in one pass.
+#  • All valid   → status='menu_valid'    → inventory_check_node
+#  • Some valid  → skips unknowns, continues with valid subset
+#  • All invalid → status='menu_invalid'  → END (main loop re-prompts for free)
 # ──────────────────────────────────────────────────────────────────────────────
 def menu_validator_node(state: RestaurantState) -> dict[str, Any]:
-    dish = _normalize_dish(state["dish_name"])
-    if dish not in MENU:
-        msg = AIMessage(
-            content=(
-                f"❌ '{state['dish_name'].title()}' is not on our menu.\n"
-                f"Available items: {', '.join(d.title() for d in MENU)}.\n"
-                "Please order one of the items above."
-            )
-        )
-        return {
-            "messages": [msg],
-            "dish_name": dish,
-            "available_qty": 0,
-            "status": "menu_invalid",
-        }
+    items   = state.get("order_items") or [{"dish": state["dish_name"], "qty": state["required_qty"]}]
+    valid   = []
+    invalid = []
 
-    msg = AIMessage(
-        content=f"✓ {dish.title()} is on our menu! Checking inventory…"
-    )
+    for item in items:
+        normalized = _normalize_dish(item["dish"])
+        if normalized in MENU:
+            valid.append({"dish": normalized, "qty": item["qty"]})
+        else:
+            invalid.append(item["dish"].title())
+
+    # Build informative message
+    lines = []
+    if invalid:
+        lines.append(f"⚠️  Skipping items not on our menu: {', '.join(invalid)}.")
+    if valid:
+        valid_names = ", ".join(f"{it['qty']}x {it['dish'].title()}" for it in valid)
+        lines.append(f"✓ Menu check passed for: {valid_names}. Checking inventory…")
+
+    if not valid:
+        lines.append(
+            f"Available items: {', '.join(d.title() for d in MENU)}.\n"
+            "Please order from the menu above."
+        )
+        msg = AIMessage(content="\n".join(lines))
+        return {"messages": [msg], "order_items": [], "status": "menu_invalid"}
+
+    msg = AIMessage(content="\n".join(lines))
+    first = valid[0]
     return {
-        "messages": [msg],
-        "dish_name": dish,   # persist normalized name
-        "status": "menu_valid",
+        "messages":    [msg],
+        "order_items": valid,
+        "dish_name":   first["dish"],
+        "required_qty": first["qty"],
+        "status":      "menu_valid",
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  NODE 3 – inventory_check_node
-#  Verifies that sufficient quantity is available.
-#  • Sufficient → status='confirm'   → create_order_node
-#  • Partial    → status='partial'   → order_retry_node
+#  Checks ALL order_items for availability.
+#
+#  Single-item order:
+#    • Sufficient → status='confirm'  → create_order
+#    • Partial    → status='partial'  → order_retry  (user negotiates)
+#
+#  Multi-item order (>1 item):
+#    • Auto-adjusts each item to available qty; skips zero-stock items.
+#    • If at least one item survives → status='confirm' → create_order
+#    • If all items are zero stock  → status='partial'  → order_retry
 # ──────────────────────────────────────────────────────────────────────────────
 def inventory_check_node(state: RestaurantState) -> dict[str, Any]:
-    dish     = state["dish_name"]
-    required = state["required_qty"]
-    avail    = MENU[dish]
+    items = state.get("order_items") or [{"dish": state["dish_name"], "qty": state["required_qty"]}]
 
-    if avail >= required:
-        msg = AIMessage(
-            content=(
-                f"✓ Inventory confirmed: {avail} portion(s) of {dish.title()} in stock.\n"
-                f"  Your order of {required} is available!"
+    # ── Single-item: keep original retry-negotiation behaviour ────────────────
+    if len(items) == 1:
+        dish     = items[0]["dish"]
+        required = items[0]["qty"]
+        avail    = MENU[dish]
+        if avail >= required:
+            msg = AIMessage(
+                content=(
+                    f"✓ Inventory confirmed: {avail} portion(s) of {dish.title()} in stock.\n"
+                    f"  Your order of {required} is available!"
+                )
             )
-        )
-        return {
-            "messages": [msg],
-            "available_qty": avail,
-            "status": "confirm",
-        }
-    else:
-        msg = AIMessage(
-            content=(
-                f"⚠️  We only have {avail} portion(s) of {dish.title()} "
-                f"(you asked for {required}).\n"
-                f"Would you like to:\n"
-                f"  1. Proceed with {avail} portion(s) (partial order)\n"
-                f"  2. Place a new order for a different dish or quantity\n"
-                "Please type your choice."
+            return {"messages": [msg], "available_qty": avail, "status": "confirm"}
+        else:
+            msg = AIMessage(
+                content=(
+                    f"⚠️  We only have {avail} portion(s) of {dish.title()} "
+                    f"(you asked for {required}).\n"
+                    "Would you like to:\n"
+                    f"  1. Proceed with {avail} portion(s) (partial order)\n"
+                    "  2. Place a new order for a different dish or quantity\n"
+                    "Please type your choice."
+                )
             )
+            return {"messages": [msg], "available_qty": avail, "status": "partial"}
+
+    # ── Multi-item: auto-adjust and report ────────────────────────────────────
+    confirmed  = []
+    notes      = []
+    for item in items:
+        dish     = item["dish"]
+        required = item["qty"]
+        avail    = MENU[dish]
+        if avail <= 0:
+            notes.append(f"  ❌ {dish.title()}: out of stock — skipped")
+        elif avail < required:
+            notes.append(
+                f"  ⚠️  {dish.title()}: only {avail} available (adjusted from {required})"
+            )
+            confirmed.append({"dish": dish, "qty": avail})
+        else:
+            notes.append(f"  ✓ {dish.title()}: {required}x in stock")
+            confirmed.append({"dish": dish, "qty": required})
+
+    if not confirmed:
+        msg = AIMessage(
+            content="⚠️  None of your items are currently in stock.\n" + "\n".join(notes)
         )
-        return {
-            "messages": [msg],
-            "available_qty": avail,
-            "status": "partial",
-        }
+        return {"messages": [msg], "available_qty": 0, "status": "partial"}
+
+    summary = "📦 Inventory check:\n" + "\n".join(notes)
+    msg = AIMessage(content=summary)
+    first = confirmed[0]
+    return {
+        "messages":    [msg],
+        "order_items": confirmed,
+        "dish_name":   first["dish"],
+        "required_qty": first["qty"],
+        "available_qty": MENU[first["dish"]],
+        "status":      "confirm",
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  NODE 4 – create_order_node
-#  Formalises the order: generates a unique order ID and prints a receipt.
-#  Always routes to cook_node (status='order_created').
+#  Formalises the order: generates a unique order ID, prints a full receipt,
+#  and populates item_queue with remaining items (all except the first, which
+#  is sent to the kitchen immediately as dish_name/required_qty).
 # ──────────────────────────────────────────────────────────────────────────────
 def create_order_node(state: RestaurantState) -> dict[str, Any]:
     order_id = f"ORD-{random.randint(1000, 9999)}"
-    dish     = state["dish_name"]
-    qty      = state["required_qty"]
+    items    = state.get("order_items") or [{"dish": state["dish_name"], "qty": state["required_qty"]}]
+
+    # Build itemised receipt
+    item_lines = "\n".join(f"   • {it['qty']}x {it['dish'].title()}" for it in items)
     msg = AIMessage(
         content=(
             f"🧾 Order {order_id} created!\n"
-            f"   • Item  : {qty}x {dish.title()}\n"
-            f"   • Status: Confirmed ✅ — sending to the kitchen now!"
+            f"{item_lines}\n"
+            f"   Status: Confirmed ✅ — sending to the kitchen now!"
         )
     )
+
+    # First item goes to cook immediately; rest queued
+    first      = items[0]
+    item_queue = items[1:]   # remaining items
+
     return {
-        "messages": [msg],
-        "order_id": order_id,
-        "status": "order_created",
+        "messages":     [msg],
+        "order_id":     order_id,
+        "order_items":  items,
+        "item_queue":   item_queue,
+        "served_items": [],        # reset for this order
+        "dish_name":    first["dish"],
+        "required_qty": first["qty"],
+        "cook_retries":  2,        # fresh budget for first item
+        "serve_retries": 2,
+        "status":       "order_created",
     }
 
 
@@ -396,8 +475,10 @@ def cook_node(state: RestaurantState) -> dict[str, Any]:
 def serve_node(state: RestaurantState) -> dict[str, Any]:
     """
     Simulates serving.
-    • 60% chance: success  → status='serve_done'  →  final_result='success'
-    • 40% chance: failure  → status='serve_failed', serve_retries decremented
+    • 60% chance: success → check item_queue:
+        - more items → pop next, reset retries, status='next_item' → cook
+        - no more    → build summary, status='complete' → end
+    • 40% chance: failure → status='serve_failed' → re-cook
     If serve_retries is 0, issue an apology.
     """
     retries_left = state["serve_retries"]
@@ -409,26 +490,52 @@ def serve_node(state: RestaurantState) -> dict[str, Any]:
                 "after multiple attempts. Your session has ended."
             )
         )
-        return {
-            "messages": [apology],
-            "status": "apology",
-            "final_result": "failed",
-        }
+        return {"messages": [apology], "status": "apology", "final_result": "failed"}
 
     failed = random.random() < 0.4
 
     if not failed:
-        msg = AIMessage(
-            content=(
-                f"🍽️  Your {state['required_qty']}x {state['dish_name'].title()} "
-                "has been served! Enjoy your meal! 😊"
-            )
+        # ── Record this item as served ────────────────────────────────────────
+        served = list(state.get("served_items") or [])
+        served.append({"dish": state["dish_name"], "qty": state["required_qty"]})
+
+        success_line = (
+            f"🍽️  Your {state['required_qty']}x {state['dish_name'].title()} "
+            "has been served! Enjoy your meal! 😊"
         )
-        return {
-            "messages": [msg],
-            "status": "complete",
-            "final_result": "success",
-        }
+
+        # ── Check if more items are queued ────────────────────────────────────
+        queue = list(state.get("item_queue") or [])
+        if queue:
+            next_item = queue.pop(0)
+            msg = AIMessage(content=success_line)
+            return {
+                "messages":     [msg],
+                "served_items": served,
+                "item_queue":   queue,
+                "dish_name":    next_item["dish"],
+                "required_qty": next_item["qty"],
+                "cook_retries":  2,    # fresh budget for next item
+                "serve_retries": 2,
+                "status":       "next_item",   # routes back to cook
+            }
+        else:
+            # ── All items served — build full summary ─────────────────────────
+            summary_lines = "\n".join(
+                f"  ✅ {it['qty']}x {it['dish'].title()}" for it in served
+            )
+            msg = AIMessage(
+                content=(
+                    f"{success_line}\n\n"
+                    f"🎉 All items served!\n{summary_lines}"
+                )
+            )
+            return {
+                "messages":     [msg],
+                "served_items": served,
+                "status":       "complete",
+                "final_result": "success",
+            }
     else:
         new_retries = retries_left - 1
         msg = AIMessage(
@@ -438,11 +545,8 @@ def serve_node(state: RestaurantState) -> dict[str, Any]:
                 f"(Serve retries remaining: {new_retries})"
             )
         )
-        return {
-            "messages": [msg],
-            "serve_retries": new_retries,
-            "status": "serve_failed",
-        }
+        return {"messages": [msg], "serve_retries": new_retries, "status": "serve_failed"}
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────

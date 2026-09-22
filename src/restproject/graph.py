@@ -89,12 +89,14 @@ def route_after_cook(state: RestaurantState) -> str:
 
 
 def route_after_serve(state: RestaurantState) -> str:
-    """Served → end; serve failed → re-cook; apology → end."""
+    """Served → end; more items → cook next; serve failed → re-cook; apology → end."""
     status = state["status"]
     if status == "complete":
         return "end"
+    if status == "next_item":
+        return "cook"    # advance to next item in the queue
     if status == "serve_failed":
-        return "cook"    # send back to kitchen (cook_retries tracks budget)
+        return "cook"    # re-cook same item
     if status == "apology":
         return "end"
     return "end"
