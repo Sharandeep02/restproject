@@ -26,12 +26,14 @@ uv.lock
 .idea/
 *.swp
 *.swo
+
 *~
 
 # ── macOS noise ───────────────────────────────────────────────────────────────
 .DS_Store
 .AppleDouble
 .LSOverride
+.j
 
 # ── Python version pin (local dev only) ──────────────────────────────────────
 .python-version
