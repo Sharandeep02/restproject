@@ -4,74 +4,97 @@ from langgraph.graph import END, START, StateGraph
 
 from .nodes import (
     cook_node,
+    create_order_node,
     end_node,
+    inventory_check_node,
     llm_node,
-    order_confirm_node,
+    menu_validator_node,
     order_retry_node,
     serve_node,
 )
 from .state import RestaurantState
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Conditional edge functions
+#  Conditional edge (routing) functions
+#
+#  New architecture (matches the diagram):
+#
+#  START → llm → menu_validator
+#                  ├─(menu_invalid)─→ END        [free re-prompt, no retry cost]
+#                  └─(menu_valid)──→ inventory_check
+#                                       ├─(partial)──→ order_retry
+#                                       │                ├─(confirm)─→ create_order
+#                                       │                ├─(pending)─→ END
+#                                       │                └─(apology)─→ end
+#                                       └─(confirm)─→ create_order
+#                                                        └──────────→ cook
+#                                                                       ├─(cook_done)───→ serve
+#                                                                       ├─(cook_failed)─→ cook
+#                                                                       └─(apology)─────→ end
+#                                                              serve
+#                                                                ├─(complete)────→ end
+#                                                                ├─(serve_failed)→ cook  [re-cook]
+#                                                                └─(apology)─────→ end
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def route_after_llm(state: RestaurantState) -> str:
-    """After the LLM extracts an order (or flags off-topic), decide next step."""
+    """LLM parsed the input — route to menu_validator or stop (off-topic)."""
     status = state["status"]
-    if status == "off_topic":
-        return "stop"          # off-topic → stop graph, main loop re-prompts
     if status == "pending":
-        return "order_confirm"  # valid order → confirm against menu
-    return "stop"
+        return "menu_validator"   # valid JSON order → check menu
+    return "stop"                 # off_topic or unparseable → main loop re-prompts
 
 
-def route_after_confirm(state: RestaurantState) -> str:
-    """After order_confirm, decide: cook, retry, or end."""
+def route_after_menu_validator(state: RestaurantState) -> str:
+    """Dish found → inventory_check; not found → END (free re-prompt)."""
+    status = state["status"]
+    if status == "menu_valid":
+        return "inventory_check"
+    return "stop"                 # menu_invalid → stop graph, main loop re-prompts
+
+
+def route_after_inventory_check(state: RestaurantState) -> str:
+    """Sufficient stock → create_order; insufficient → order_retry."""
     status = state["status"]
     if status == "confirm":
-        return "cook"
-    if status in ("partial", "unavailable"):
+        return "create_order"
+    if status == "partial":
         return "order_retry"
     return "end"
 
 
 def route_after_retry(state: RestaurantState) -> str:
-    """After order_retry, decide: cook (partial accepted), stop for new input, or end."""
+    """User responded to partial/unavailable offer."""
     status = state["status"]
     if status == "confirm":
-        return "cook"       # user accepted partial qty → proceed to kitchen
+        return "create_order"   # user accepted partial → create order
     if status == "pending":
-        return "stop"       # needs new user input → stop graph, main loop handles
+        return "stop"           # user wants new order → stop, main loop asks again
     if status == "apology":
         return "end"
     return "end"
 
 
 def route_after_cook(state: RestaurantState) -> str:
-    """After cook_node, decide: serve, retry cook, or end."""
+    """Cook succeeded → serve; failed with retries → cook again; exhausted → end."""
     status = state["status"]
     if status == "cook_done":
         return "serve"
     if status == "cook_failed":
-        retries = state["cook_retries"]
-        if retries > 0:
-            return "cook"   # retry cooking
-        else:
-            return "end"
+        return "cook" if state["cook_retries"] > 0 else "end"
     if status == "apology":
         return "end"
     return "end"
 
 
 def route_after_serve(state: RestaurantState) -> str:
-    """After serve_node: success → end, fail → back to cook (re-cook), apology → end."""
+    """Served → end; serve failed → re-cook; apology → end."""
     status = state["status"]
     if status == "complete":
         return "end"
     if status == "serve_failed":
-        # Serve failure sends order back to kitchen (cook retries)
-        return "cook"
+        return "cook"    # send back to kitchen (cook_retries tracks budget)
     if status == "apology":
         return "end"
     return "end"
@@ -85,12 +108,14 @@ def build_graph() -> StateGraph:
     builder = StateGraph(RestaurantState)
 
     # ── Register nodes ────────────────────────────────────────────────────────
-    builder.add_node("llm", llm_node)
-    builder.add_node("order_confirm", order_confirm_node)
-    builder.add_node("order_retry", order_retry_node)
-    builder.add_node("cook", cook_node)
-    builder.add_node("serve", serve_node)
-    builder.add_node("end", end_node)
+    builder.add_node("llm",              llm_node)
+    builder.add_node("menu_validator",   menu_validator_node)
+    builder.add_node("inventory_check",  inventory_check_node)
+    builder.add_node("create_order",     create_order_node)
+    builder.add_node("order_retry",      order_retry_node)
+    builder.add_node("cook",             cook_node)
+    builder.add_node("serve",            serve_node)
+    builder.add_node("end",              end_node)
 
     # ── Entry point ───────────────────────────────────────────────────────────
     builder.add_edge(START, "llm")
@@ -99,49 +124,40 @@ def build_graph() -> StateGraph:
     builder.add_conditional_edges(
         "llm",
         route_after_llm,
-        {
-            "order_confirm": "order_confirm",
-            "stop": END,           # off-topic or unrecognised → stop graph
-        },
+        {"menu_validator": "menu_validator", "stop": END},
     )
 
     builder.add_conditional_edges(
-        "order_confirm",
-        route_after_confirm,
-        {
-            "cook": "cook",
-            "order_retry": "order_retry",
-            "end": "end",
-        },
+        "menu_validator",
+        route_after_menu_validator,
+        {"inventory_check": "inventory_check", "stop": END},
     )
+
+    builder.add_conditional_edges(
+        "inventory_check",
+        route_after_inventory_check,
+        {"create_order": "create_order", "order_retry": "order_retry", "end": "end"},
+    )
+
+    # create_order always feeds straight into cook (no branching)
+    builder.add_edge("create_order", "cook")
 
     builder.add_conditional_edges(
         "order_retry",
         route_after_retry,
-        {
-            "cook": "cook",
-            "stop": END,           # pending new user input → stop, main loop prompts
-            "end": "end",
-        },
+        {"create_order": "create_order", "stop": END, "end": "end"},
     )
 
     builder.add_conditional_edges(
         "cook",
         route_after_cook,
-        {
-            "serve": "serve",
-            "cook": "cook",
-            "end": "end",
-        },
+        {"serve": "serve", "cook": "cook", "end": "end"},
     )
 
     builder.add_conditional_edges(
         "serve",
         route_after_serve,
-        {
-            "end": "end",
-            "cook": "cook",        # serve fail → back to kitchen for re-cook
-        },
+        {"end": "end", "cook": "cook"},
     )
 
     # ── Terminal edge ─────────────────────────────────────────────────────────

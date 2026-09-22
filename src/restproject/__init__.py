@@ -44,12 +44,16 @@ def _step_label(i: int, total: int, content: str) -> str:
         return "🤖"
     if "check availability" in c or "noted your order" in c:
         return "📋 Order Received"
-    if "not on our menu" in c or "only have" in c or "please tell me" in c:
-        return "⚠️  Menu Check"
-    if "confirmed" in c and "kitchen" in c:
-        return "✅ Order Confirmed"
-    if "partial" in c or "portion" in c:
+    if "not on our menu" in c or "is not on our menu" in c:
+        return "❌ Menu Check"
+    if "✓" in c and "menu" in c:
+        return "📋 Menu ✓"
+    if "only have" in c or "please tell me" in c or "would you like" in c:
         return "⚠️  Partial Stock"
+    if "inventory confirmed" in c or "is available" in c:
+        return "📦 Inventory ✓"
+    if "order" in c and "created" in c:
+        return "🧾 Order Created"
     if "hiccup" in c or "trying again" in c or "prepared successfully" in c:
         return "🍳 Kitchen"
     if "served" in c or "enjoy your meal" in c:
@@ -97,6 +101,7 @@ def main() -> None:
         "dish_name": "",
         "required_qty": 0,
         "available_qty": 0,
+        "order_id": "",
         "status": "pending",
         "order_retries": 3,
         "cook_retries": 2,
@@ -133,17 +138,15 @@ def main() -> None:
         _print_order_status(state, prev_msg_count)
 
         # ── Check terminal conditions ─────────────────────────────────────────
-        terminal_statuses = {"complete", "apology", "off_topic"}
+        terminal_statuses = {"complete", "apology", "off_topic", "menu_invalid"}
         current_status = state.get("status", "")
 
         if current_status in terminal_statuses:
-            if current_status == "off_topic":
-                # Off-topic: reset for fresh order attempt
-                # Give the user a chance to place a real order
-                print("[System] You can place a food order or type 'exit' to quit.\n")
-                # Reset status so the graph runs fresh
+            if current_status in ("off_topic", "menu_invalid"):
+                # Soft stop — re-prompt without consuming an order_retry slot
+                print("[System] Please place a food order from our menu, or type 'exit' to quit.\n")
                 state["status"] = "pending"
-                state["messages"] = []   # clear history for a clean start
+                state["messages"] = []
             else:
                 session_active = False
 

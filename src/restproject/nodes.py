@@ -124,7 +124,7 @@ def llm_node(state: RestaurantState) -> dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  NODE 2 – order_confirm_node
+#  Helper – dish name normalizer (shared by menu_validator_node)
 # ──────────────────────────────────────────────────────────────────────────────
 def _normalize_dish(raw: str) -> str:
     """
@@ -147,70 +147,106 @@ def _normalize_dish(raw: str) -> str:
         if raw.startswith(key) or key.startswith(raw):
             return key
 
-    return raw   # return as-is; order_confirm will handle the unavailable case
+    return raw   # return as-is; menu_validator will handle the unavailable case
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  NODE 2 – order_confirm_node
+#  NODE 2 – menu_validator_node
+#  Checks whether the requested dish exists on the menu.
+#  • Found     → status='menu_valid'    → inventory_check_node
+#  • Not found → status='menu_invalid'  → END (main loop re-prompts for free)
 # ──────────────────────────────────────────────────────────────────────────────
-def order_confirm_node(state: RestaurantState) -> dict[str, Any]:
-    """
-    Checks the menu and sets status to:
-      • 'confirm'      – dish available and qty sufficient
-      • 'partial'      – dish in menu but qty insufficient
-      • 'unavailable'  – dish not in menu
-    Also writes available_qty into the state.
-    """
-    dish = _normalize_dish(state["dish_name"])   # normalize before lookup
-    required = state["required_qty"]
-
+def menu_validator_node(state: RestaurantState) -> dict[str, Any]:
+    dish = _normalize_dish(state["dish_name"])
     if dish not in MENU:
         msg = AIMessage(
             content=(
-                f"Sorry, '{state['dish_name'].title()}' is not on our menu. "
-                f"Available items: {', '.join(d.title() for d in MENU)}."
+                f"❌ '{state['dish_name'].title()}' is not on our menu.\n"
+                f"Available items: {', '.join(d.title() for d in MENU)}.\n"
+                "Please order one of the items above."
             )
         )
         return {
             "messages": [msg],
-            "available_qty": 0,
             "dish_name": dish,
-            "status": "unavailable",
+            "available_qty": 0,
+            "status": "menu_invalid",
         }
 
+    msg = AIMessage(
+        content=f"✓ {dish.title()} is on our menu! Checking inventory…"
+    )
+    return {
+        "messages": [msg],
+        "dish_name": dish,   # persist normalized name
+        "status": "menu_valid",
+    }
 
-    avail = MENU[dish]
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  NODE 3 – inventory_check_node
+#  Verifies that sufficient quantity is available.
+#  • Sufficient → status='confirm'   → create_order_node
+#  • Partial    → status='partial'   → order_retry_node
+# ──────────────────────────────────────────────────────────────────────────────
+def inventory_check_node(state: RestaurantState) -> dict[str, Any]:
+    dish     = state["dish_name"]
+    required = state["required_qty"]
+    avail    = MENU[dish]
 
     if avail >= required:
         msg = AIMessage(
             content=(
-                f"Great news! We have {avail} portions of {dish.title()} available "
-                f"and your order of {required} is confirmed. Sending to the kitchen!"
+                f"✓ Inventory confirmed: {avail} portion(s) of {dish.title()} in stock.\n"
+                f"  Your order of {required} is available!"
             )
         )
         return {
             "messages": [msg],
             "available_qty": avail,
-            "dish_name": dish,   # persist normalized name
             "status": "confirm",
         }
     else:
         msg = AIMessage(
             content=(
-                f"We only have {avail} portion(s) of {dish.title()} "
-                f"(you asked for {required}). "
+                f"⚠️  We only have {avail} portion(s) of {dish.title()} "
+                f"(you asked for {required}).\n"
                 f"Would you like to:\n"
                 f"  1. Proceed with {avail} portion(s) (partial order)\n"
                 f"  2. Place a new order for a different dish or quantity\n"
-                f"Please type your choice."
+                "Please type your choice."
             )
         )
         return {
             "messages": [msg],
             "available_qty": avail,
-            "dish_name": dish,   # persist normalized name
             "status": "partial",
         }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  NODE 4 – create_order_node
+#  Formalises the order: generates a unique order ID and prints a receipt.
+#  Always routes to cook_node (status='order_created').
+# ──────────────────────────────────────────────────────────────────────────────
+def create_order_node(state: RestaurantState) -> dict[str, Any]:
+    order_id = f"ORD-{random.randint(1000, 9999)}"
+    dish     = state["dish_name"]
+    qty      = state["required_qty"]
+    msg = AIMessage(
+        content=(
+            f"🧾 Order {order_id} created!\n"
+            f"   • Item  : {qty}x {dish.title()}\n"
+            f"   • Status: Confirmed ✅ — sending to the kitchen now!"
+        )
+    )
+    return {
+        "messages": [msg],
+        "order_id": order_id,
+        "status": "order_created",
+    }
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────

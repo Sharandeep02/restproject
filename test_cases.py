@@ -33,6 +33,7 @@ def _make_state() -> RestaurantState:
         "dish_name":      "",
         "required_qty":   0,
         "available_qty":  0,
+        "order_id":       "",
         "status":         "pending",
         "order_retries":  3,
         "cook_retries":   2,
@@ -111,9 +112,9 @@ def _run_session(
             current_status = state.get("status", "")
 
             # ── Main-loop routing (mirrors __init__.py main()) ────────────
-            if current_status == "off_topic":
-                # Reset for fresh order attempt (don't end session)
-                print("  [off-topic: resetting for new order attempt]")
+            if current_status in ("off_topic", "menu_invalid"):
+                # Free re-prompt: reset for new order attempt
+                print(f"  [{ current_status }: resetting for new order attempt]")
                 state["status"]   = "pending"
                 state["messages"] = []
 
@@ -135,26 +136,35 @@ def _run_session(
 
 def test_tc1() -> bool:
     print("\n" + "═"*62)
-    print("  TEST CASE 1")
-    print("  i.  off-topic question")
-    print("  ii. partial order (burger, need 20, only 10 avail)")
-    print("  iii.reject partial → new order: unavailable dish (sushi)")
-    print("  iv. another unavailable dish (lobster)")
+    print("  TEST CASE 1 (updated for new architecture)")
+    print("  i.  off-topic question → free re-prompt")
+    print("  ii. unknown dish (sushi) → menu_invalid → free re-prompt")
+    print("  iii.partial order (burger, need 20, only 10) → retry cost")
+    print("  iv. partial again → retry cost")
+    print("  v.  partial again → retries=0 → apology")
     print("  Expected: order retries exhausted → FAIL")
     print("═"*62)
 
+    # In the new architecture:
+    #   off_topic    → free re-prompt (order_retries unchanged)
+    #   menu_invalid → free re-prompt (order_retries unchanged)
+    #   partial      → burns one order_retry slot
+    # So we exhaust retries via 3 partial rejections.
+
     user_inputs = [
-        "What is the weather today?",   # i.  off-topic
-        "I want 20 burgers",            # ii. partial (menu has 10)
-        "No, I want sushi please",      # iii.reject + unavailable
-        "I want some lobster",          # iv. unavailable → retries=0 → apology
+        "What is the weather today?",  # i.  off-topic → free
+        "I want sushi",                # ii. menu_invalid → free
+        "I want 20 burgers",           # iii.partial (10 avail) → retries 3→2
+        "No, I want 20 burgers",       # iv. partial again     → retries 2→1
+        "Still want 20 burgers",       # v.  partial again     → retries 1→0 → apology
     ]
 
     llm_responses = [
-        "OFFTOPIC",                           # i.
-        '{"dish": "burger", "qty": 20}',      # ii.
-        '{"dish": "sushi",  "qty": 1}',       # iii.
-        '{"dish": "lobster","qty": 1}',        # iv.
+        "OFFTOPIC",                          # i.
+        '{"dish": "sushi",  "qty": 1}',      # ii.  → menu_invalid
+        '{"dish": "burger", "qty": 20}',     # iii. → partial
+        '{"dish": "burger", "qty": 20}',     # iv.  → partial
+        '{"dish": "burger", "qty": 20}',     # v.   → apology
     ]
 
     state = _run_session(user_inputs, llm_responses, [], "TC1")
@@ -163,6 +173,7 @@ def test_tc1() -> bool:
     print(f"  Result: {'✅ PASS' if passed else '❌ FAIL'}  "
           f"(expected final_result='failed', got '{state.get('final_result')}')")
     return passed
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

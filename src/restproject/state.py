@@ -14,30 +14,32 @@ class RestaurantState(TypedDict):
     messages: Annotated[list, add_messages]
 
     # ── Extracted order details ───────────────────────────────────────────────
-    dish_name: str          # Extracted dish name
+    dish_name: str          # Extracted dish name (normalized to menu key)
     required_qty: int       # Quantity the user asked for
     available_qty: int      # Quantity available in the menu (0 = not in menu)
 
+    # ── Order tracking ────────────────────────────────────────────────────────
+    order_id: str           # e.g. "ORD-4821"; set by create_order_node
+
     # ── Pipeline status ───────────────────────────────────────────────────────
-    # Possible values:
+    # Possible values (in flow order):
     #   "pending"        – initial / waiting for LLM to extract order
-    #   "confirm"        – dish + qty fully available
-    #   "partial"        – dish available but qty insufficient
-    #   "unavailable"    – dish not on menu / qty = 0
-    #   "cooking"        – cook node is running
-    #   "cook_done"      – cook succeeded
-    #   "cook_failed"    – cook failed this attempt
-    #   "serving"        – serve node is running
-    #   "serve_done"     – serve succeeded
-    #   "serve_failed"   – serve failed this attempt
-    #   "complete"       – order fully completed and delivered
-    #   "apology"        – something went wrong; session ending
-    #   "off_topic"      – user asked a non-food question
+    #   "off_topic"      – user asked a non-food question → re-prompt
+    #   "menu_valid"     – dish found on menu → proceed to inventory_check
+    #   "menu_invalid"   – dish not on menu → ask customer (free re-prompt)
+    #   "confirm"        – dish + qty fully available → create_order
+    #   "partial"        – dish available but qty insufficient → order_retry
+    #   "order_created"  – order ID assigned → cook
+    #   "cook_done"      – cook succeeded → serve
+    #   "cook_failed"    – cook failed (retries remain) → cook again
+    #   "serve_failed"   – serve failed → re-cook
+    #   "complete"       – order fully completed and delivered → end
+    #   "apology"        – retries exhausted; session ending → end
     status: str
 
     # ── Retry counters ────────────────────────────────────────────────────────
     order_retries: int   # starts at 3 – decrements on each partial/unavail
-    cook_retries: int    # starts at 2 – decrements on each cook failure
+    cook_retries: int    # starts at 2 – decrements on each cook failure / re-cook
     serve_retries: int   # starts at 2 – decrements on each serve failure
 
     # ── Final result ──────────────────────────────────────────────────────────
